@@ -3,9 +3,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 
 #define BUFFER_SIZE 1024
-#define PORT 8080
+#define PORT 5926
 
 int main() {
     int sockfd;
@@ -26,7 +27,7 @@ int main() {
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
-    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    server_addr.sin_addr.s_addr = inet_addr("IP_BROKER");
 
     printf("Tema a suscribirse (ej: EquipoAvsB): ");
     fgets(topic, 50, stdin);
@@ -39,6 +40,8 @@ int main() {
     printf("Suscrito al tema: %s\nEsperando mensajes...\n", topic);
 
     while (1) {
+
+        //Esta línea limpia el contenido del buffer antes de recibir nuevos datos.
         memset(buffer, 0, BUFFER_SIZE);
         recvfrom(sockfd, buffer, BUFFER_SIZE, 0, NULL, NULL);
         printf("[Mensaje recibido] %s\n", buffer);
