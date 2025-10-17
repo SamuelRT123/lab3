@@ -376,18 +376,13 @@ int main(void)
             int r = recv_pkt(sockfd, &from, &hdr, payload, sizeof(payload), 0, 0);
             if (r >= 0) {
                 // Si es SUBSCRIBE/ACK/NACK/PKT_PING, el payload venía cifrado
-                int needs_decrypt = (hdr.type == PKT_SUBSCRIBE ||
-                                     hdr.type == PKT_ACK ||
-                                     hdr.type == PKT_NACK ||
-                                     hdr.type == PKT_PING);
-                if (needs_decrypt) {
-                    // volvemos a leer el mismo datagrama? no: ya lo consumimos.
-                    // Solución: Interpretar con lo que tenemos: lo recibimos "en claro".
-                    // Re-leemos correctamente: truco -> ya leímos, así que en vez de re-leer,
-                    // repetimos proceso manual: como hicimos recv con decrypt=0,
-                    // desencriptamos el buffer local (payload) aquí:
-                    xor_cipher(payload, hdr.length, BROKER_KEY);
-                }
+                // Después: incluye PKT_DATA
+            int needs_decrypt = (hdr.type == PKT_SUBSCRIBE ||
+                                hdr.type == PKT_ACK ||
+                                hdr.type == PKT_NACK ||
+                                hdr.type == PKT_PING ||
+                                hdr.type == PKT_DATA);
+            if (needs_decrypt) xor_cipher(payload, hdr.length, BROKER_KEY);
 
                 client_t *cl = get_client(&from);
                 if (cl) cl->last_seen = time(NULL);
@@ -452,9 +447,23 @@ int main(void)
                         // No se espera desde el suscriptor
                         break;
 
-                    case PKT_DATA:
-                        // El broker no debería recibir DATA del suscriptor en este esquema
+                    case PKT_DATA: {
+                        // Tratar DATA entrante como publicación en stream hdr.stream_id
+                        // Guardar y reenviar a suscriptores (como publish_to_subscribers)
+                        stream_state_t *st = get_stream(hdr.stream_id);
+                        if (!st) break;
+                        // Si viene cifrado ya lo desciframos arriba
+
+                        uint8_t flags = hdr.flags;
+                        uint16_t len  = (uint16_t)hdr.length;
+                        // Guardar con la secuencia "propia" del broker (continuidad para sus clientes)
+                        // Opción A (simple): el broker asigna su propia seq:
+                        publish_to_subscribers(sockfd, hdr.stream_id, payload, len, flags);
+
+                        // (Opcional Opción B: respetar hdr.seq del publisher y guardarlo manualmente)
                         break;
+                    }
+
 
                     default:
                         break;
