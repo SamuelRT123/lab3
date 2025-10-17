@@ -285,3 +285,220 @@ static void resend_range(int sock, client_t *cl, stream_state_t *st,
                                st->history[idx].seq,
                                st->history[idx].data,
                                st->history[idx].len,
+                               BROKER_KEY, 1);
+                break;
+            }
+        }
+    }
+}
+
+// Publicar a todos los clientes suscritos a stream_id
+static void publish_to_subscribers(int sock, uint32_t stream_id,
+                                   const char *msg, uint16_t len, uint8_t flags)
+{
+    stream_state_t *st = get_stream(stream_id);
+    if (!st) return;
+
+    uint64_t seq = st->next_seq++;
+    // Guardar en buffer para posibles retransmisiones
+    stream_store(st, seq, msg, len, flags);
+
+    for (size_t i = 0; i < MAX_CLIENTS; ++i) {
+        if (!clients[i].active) continue;
+        if (!client_is_subscribed(&clients[i], stream_id)) continue;
+        (void)send_pkt(sock, &clients[i].addr, PKT_DATA, flags, stream_id,
+                       seq, msg, len, BROKER_KEY, 1);
+    }
+}
+
+// ====== Broker main ======
+int main(void)
+{
+    int sockfd;
+    struct sockaddr_in srv;
+
+    memset(clients, 0, sizeof(clients));
+    memset(streams, 0, sizeof(streams));
+    n_streams = 0;
+
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    int reuse = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        perror("setsockopt SO_REUSEADDR");
+    }
+
+    memset(&srv, 0, sizeof(srv));
+    srv.sin_family = AF_INET;
+    srv.sin_port = htons(PORT);
+    srv.sin_addr.s_addr = inet_addr(IP_BIND);
+
+    if (bind(sockfd, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
+        perror("bind");
+        close(sockfd);
+        return 1;
+    }
+
+    // Hacer stdin no bloqueante para poder usar select()
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+
+    printf("Broker escuchando en %s:%d (clave XOR=%d)\n", IP_BIND, PORT, BROKER_KEY);
+    printf("Formato de publicación por stdin:  topic|mensaje\n");
+    printf("Ejemplo:  EquipoAvsB|Gol minuto 45\n");
+
+    fd_set rfds;
+    for (;;) {
+        FD_ZERO(&rfds);
+        FD_SET(sockfd, &rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        int maxfd = (sockfd > STDIN_FILENO ? sockfd : STDIN_FILENO);
+
+        struct timeval tv = { RECV_TIMEOUT_SEC, 0 };
+        int rv = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (rv < 0) {
+            if (errno == EINTR) continue;
+            perror("select");
+            break;
+        }
+
+        // Entrada de red
+        if (FD_ISSET(sockfd, &rfds)) {
+            struct sockaddr_in from;
+            quic_like_header_t hdr;
+            char payload[MAX_PAYLOAD];
+
+            // Intentamos recibir sin desencriptar primero para ver el tipo:
+            int r = recv_pkt(sockfd, &from, &hdr, payload, sizeof(payload), 0, 0);
+            if (r >= 0) {
+                // Si es SUBSCRIBE/ACK/NACK/PKT_PING, el payload venía cifrado
+                int needs_decrypt = (hdr.type == PKT_SUBSCRIBE ||
+                                     hdr.type == PKT_ACK ||
+                                     hdr.type == PKT_NACK ||
+                                     hdr.type == PKT_PING);
+                if (needs_decrypt) {
+                    // volvemos a leer el mismo datagrama? no: ya lo consumimos.
+                    // Solución: Interpretar con lo que tenemos: lo recibimos "en claro".
+                    // Re-leemos correctamente: truco -> ya leímos, así que en vez de re-leer,
+                    // repetimos proceso manual: como hicimos recv con decrypt=0,
+                    // desencriptamos el buffer local (payload) aquí:
+                    xor_cipher(payload, hdr.length, BROKER_KEY);
+                }
+
+                client_t *cl = get_client(&from);
+                if (cl) cl->last_seen = time(NULL);
+
+                switch (hdr.type) {
+                    case PKT_HELLO: {
+                        const char reply[16];
+                        // Enviar PKT_HELLO_REPLY en claro con KEY:n
+                        // No ciframos el payload del HELLO_REPLY:
+                        char msg[32];
+                        snprintf(msg, sizeof(msg), "KEY:%d", BROKER_KEY);
+                        (void)send_pkt(sockfd, &from, PKT_HELLO_REPLY, 0, 0, 0,
+                                       msg, (uint32_t)strlen(msg), 0, 0);
+                        break;
+                    }
+
+                    case PKT_SUBSCRIBE: {
+                        // payload: "SUB:<stream_id>"
+                        payload[r] = '\0';
+                        if (strncmp(payload, "SUB:", 4) == 0) {
+                            uint32_t sid = (uint32_t)strtoul(payload + 4, NULL, 10);
+                            (void)get_stream(sid);
+                            if (client_subscribe(cl, sid) == 0) {
+                                // ACK opcional de suscripción
+                                const char ok[] = "SUB_OK";
+                                (void)send_pkt(sockfd, &from, PKT_ACK, 0, sid, 0,
+                                               ok, (uint32_t)strlen(ok), BROKER_KEY, 1);
+                                fprintf(stderr, "Cliente suscrito a stream_id=%u\n", sid);
+                            }
+                        }
+                        break;
+                    }
+
+                    case PKT_ACK: {
+                        // payload: "ACK:<seq>"
+                        // Podemos registrar stats o ignorar
+                        break;
+                    }
+
+                    case PKT_NACK: {
+                        // payload: "NACK:<from>-<to>"
+                        payload[r] = '\0';
+                        uint64_t a = 0, b = 0;
+                        if (sscanf(payload, "NACK:%llu-%llu",
+                                   (unsigned long long*)&a,
+                                   (unsigned long long*)&b) == 2) {
+                            // Reenviar rango al cliente para hdr.stream_id
+                            stream_state_t *st = get_stream(hdr.stream_id);
+                            resend_range(sockfd, cl, st, a, b);
+                        }
+                        break;
+                    }
+
+                    case PKT_PING: {
+                        const char pong[] = "PONG";
+                        (void)send_pkt(sockfd, &from, PKT_PONG, 0, 0, 0,
+                                       pong, (uint32_t)strlen(pong), BROKER_KEY, 1);
+                        break;
+                    }
+
+                    case PKT_PONG:
+                        // No se espera desde el suscriptor
+                        break;
+
+                    case PKT_DATA:
+                        // El broker no debería recibir DATA del suscriptor en este esquema
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+        }
+
+        // Entrada por stdin (publicación)
+        if (FD_ISSET(STDIN_FILENO, &rfds)) {
+            char line[2048];
+            ssize_t n = read(STDIN_FILENO, line, sizeof(line) - 1);
+            if (n > 0) {
+                line[n] = '\0';
+                // Quitar \n finales
+                char *p = line;
+                while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) {
+                    line[n-1] = '\0';
+                    n--;
+                }
+                if (n == 0) continue;
+
+                // Formato: topic|mensaje
+                char *bar = strchr(line, '|');
+                if (!bar) {
+                    // Si no hay '|', tomamos un topic por defecto "default"
+                    const char *topic = "default";
+                    uint32_t sid = djb2_hash(topic);
+                    uint8_t flags = 0;
+                    publish_to_subscribers(sockfd, sid, line, (uint16_t)strlen(line), flags);
+                } else {
+                    *bar = '\0';
+                    const char *topic = line;
+                    const char *msg = bar + 1;
+                    uint32_t sid = djb2_hash(topic);
+                    uint8_t flags = 0;
+                    publish_to_subscribers(sockfd, sid, msg, (uint16_t)strlen(msg), flags);
+                }
+            }
+        }
+
+        // Mantenimiento
+        purge_inactive_clients();
+    }
+
+    close(sockfd);
+    return 0;
+}
